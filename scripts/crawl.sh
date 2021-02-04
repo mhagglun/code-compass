@@ -19,7 +19,7 @@ fi
 
 #check for gitGrab file
 if [ $usecache -eq 0 -o ! -f $basedir/gitGrab.json ] ; then
-	./gitgrab.py $basedir $language fast $maxprojects $minstars $maxsize
+	./gitgrab.py -d $basedir -l $language --max $maxprojects --min_stars $minstars --max_size $maxsize
 fi
 
 #check for download scripts

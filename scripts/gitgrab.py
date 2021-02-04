@@ -1,202 +1,165 @@
 #!/usr/bin/env python
-
-# Copyright (C) 2019, Nokia
-# Licensed under the BSD 3-Clause License
-
-
-import json
-from github import Github
-from tqdm import tqdm
-from datetime import date
-import pandas as pd
-import time
-#import traceback
 import sys
+import json
+import math
+import time
+import datetime
+import requests
 
+from tqdm import tqdm
+from types import SimpleNamespace
+from argparse import ArgumentParser
 
-basedir = sys.argv[1] if len(sys.argv) > 1 else '.'
-language = sys.argv[2] if len(sys.argv) > 2 else 'python'
-full = True if len(sys.argv) > 3 and sys.argv[3].lower() == 'full' else False
-maxprojects = int(sys.argv[4]) if len(sys.argv) > 4 else 0
-minstars = int(sys.argv[5]) if len(sys.argv) > 5 else 2
-# maxsize (in kb)
-maxsize = int(sys.argv[6]) if len(sys.argv) > 6 else 0
-maxstars = 1000000
-
-
-basequery = 'language:'+language 
-
-if language == 'all':
-    basequery = ''
-elif language == 'javascript':
-    basequery = basequery + ' language:typescript'
 
 gitgrab = []
-
-daterange = pd.date_range(date(2008, 1,1), date.today())
-
-outfilename = basedir+('/gitGrabFull.json' if full else '/gitGrab.json')
-
-###################
-    
+BASE_URL = "https://api.github.com/search/repositories"
 
 
-with open('apikey.txt', 'r') as fd:
-    APIKEY = fd.read().rstrip()
+def cooldown(headers):
+    threshold = 100
+    try:
+        limit = headers['X-RateLimit-Limit']
+        remaining = headers['X-RateLimit-Remaining']
+        reset = headers['X-RateLimit-Reset']
+        if remaining >= remainingthreshold:
+            return
+        else:
+            time_to_sleep = math.ceil(math.abs(reset - time.time()) / 1000)
+            print("Cooling down for %s seconds until: %s" & (time_to_sleep, datetime.datetime.fromtimestamp(
+                reset).strftime('%c')))
+            time.sleep(time_to_sleep)
+    except:
+        time.sleep(10)
 
 
-if not APIKEY:
-    print("Please first paste your API key in file apikey.txt!")
-    sys.exit(1)
-
-#print("APIKEY =", APIKEY)
-# Access by token
-g = Github(APIKEY, per_page=100)
-
-###################
-
-
-def cooldown(g):
-    first = True
-    remainingthreshold = 100 if full else 50
-    while True:
-        try:
-            core = g.get_rate_limit().core
-            search = g.get_rate_limit().search
-            if core.remaining >= remainingthreshold and search.remaining >= 5: return
-            #TODO: check with resettime
-            if first:
-                print("Cooling down until:", core.reset.isoformat(), 'UTC', core, search)
-            first = False
-            time.sleep(60)
-        except:
-            #traceback.print_exc()
-            time.sleep(5)
-
-def search_repos(g, query):
-    repos = None
-    cooldown(g)
-    while repos == None:
-        try:
-            repos = g.search_repositories(query=query)
-        except:
-            print("RETRYING REPOS")
-            time.sleep(30)
-    return repos
-
-def count_repos(g, query):
-    repos = search_repos(g, query)
-    count = None
-    while count == None:
-        try:
-            count = repos.totalCount
-        except:
-            print("COUNT ISSUE")
-            time.sleep(30)
-    return count
-
-def fetch_repos(g, gitgrab, query):
-    repos = search_repos(g, query)
-
-    #cut off
-    maxnewprojects = maxprojects - len(gitgrab) if maxprojects else 0
+def fetch_repos(headers, query, page, args):
+    # cut off
+    maxnewprojects = args.maxprojects - len(gitgrab) if args.maxprojects else 0
     if maxnewprojects < 0:
         return 0
+
+    response = requests.get("%s?page=%s&q=%s" % (
+        BASE_URL, page, query), headers=headers)
+
+    cooldown(response.headers)
+
+    response = json.loads(
+        response.text, object_hook=lambda d: SimpleNamespace(**d))
 
     newgitgrab = None
     while newgitgrab == None:
         try:
             newgitgrab = []
-            for idx, repo in tqdm(enumerate(repos)):
-                cooldown(g)
-
-                if maxsize and repo.size > maxsize:
-                    print("Skipping oversized project", repo.full_name, ":", repo.size, "kb")
+            newcount = 0
+            for idx, repo in enumerate(response.items):
+                if args.maxsize > 0 and repo.size > args.maxsize:
+                    print("Skipping oversized project",
+                          repo.full_name, ":", repo.size, "kb")
                     continue
 
                 license = ""
                 try:
-                    if full: license = repo.get_license().license.key
-                except: 
+                    license = repo.license.key
+                except:
                     pass
                 topics = []
                 try:
-                    if full: topics = repo.get_topics()
+                    topics = repo.topics
                 except:
                     pass
-                languages = [repo.language]
+                languages = ""
                 try:
-                    if full: languages = repo.get_languages()
+                    languages = repo.language
                 except:
                     pass
-        
+
                 newgitgrab.append({
-                    'full_name':repo.full_name,
+                    'full_name': repo.full_name,
                     'description': repo.description,
                     'topics': topics,
                     'git_url': repo.git_url,
                     'stars': repo.stargazers_count,
                     'watchers': repo.watchers_count,
                     'forks': repo.forks,
-                    'created': repo.created_at.isoformat()+'Z',
+                    'created': repo.created_at,
                     'size': repo.size,
                     'license': license,
                     'language': repo.language,
                     'languages': languages,
-                    'last_updated': repo.updated_at.isoformat()+'Z',
+                    'last_updated': repo.updated_at,
                 })
-                if maxnewprojects and len(newgitgrab) >= maxnewprojects:
-                    break;
+
+                newcount += 1
+                if maxnewprojects and newcount >= maxnewprojects:
+                    break
+
             gitgrab.extend(newgitgrab)
-        except:
+            time.sleep(5)
+        except Exception as e:
+            if isinstance(e, KeyboardInterrupt):
+                print("Aborting.")
+                sys.exit(1)
             print("Retrying BLOCK")
             newgitgrab = None
             time.sleep(30)
-    return len(newgitgrab)
 
-def print_rate_limit(g, d, count):
-    try:
-        print(d, count, "repos", g.get_rate_limit())
-    except:
-        print(d, count, "repos")
+    return newcount
 
 
-for idx, d in enumerate(reversed(daterange)):
-    query = '%s stars:%d..%d created:%s' % (basequery, minstars, maxstars, d.strftime("%Y-%m-%d"))
-    count = count_repos(g, query)
-    newcount = 0
-    if count < 1000:
-        print_rate_limit(g, d, count)
-        newcount += fetch_repos(g, gitgrab, query)
-    else:
-        curminstars = minstars
-        curmaxstars = 4
-        while curminstars < maxstars:
-            query = '%s stars:%d..%d created:%s' % (basequery, curminstars, curmaxstars, d.strftime("%Y-%m-%d"))
-            count = count_repos(g, query)
-            print("Splitting [%d..%d]: %d"%(curminstars, curmaxstars, count))
-            if count >= 1000 and curmaxstars > curminstars:
-                curmaxstars -= max(1, (curmaxstars - curminstars)//2)
-                continue
-            print_rate_limit(g, d, count)
-            newcount += fetch_repos(g, gitgrab, query)
-            curminstars = curmaxstars + 1
-            curmaxstars = maxstars 
- 
-    #cut off
-    if maxprojects and len(gitgrab) >= maxprojects:
-        gitgrab = gitgrab[:maxprojects]
-        break
+if __name__ == "__main__":
 
-    # dump every 7 days 
-    if idx % 7 == 6:            
-        print(f"DUMPING {len(gitgrab)}, {newcount} NEW")
-        with open(outfilename, 'wt') as fd:
-            fd.write(json.dumps(gitgrab))
+    parser = ArgumentParser()
+    parser.add_argument("-d", "--dir", dest="basedir", type=str, default=".",
+                        help="The directory to download to", required=False)
+    parser.add_argument("-l", "--lang", dest="language", type=str, default="python",
+                        help="The language of source code to filter by", required=False)
+    parser.add_argument("-m", "--max", dest="maxprojects", type=int, default=1000,
+                        help="The maximum number of projects", required=False)
+    parser.add_argument("--min_stars", dest="minstars", type=int, default=10,
+                        help="The minimum number of stars for the repository", required=False)
+    parser.add_argument("--max_stars", dest="maxstars", type=int, default=1000000,
+                        help="The maximum number of stars for the repository", required=False)
+    parser.add_argument("--max_size", dest="maxsize", type=int, default=0,
+                        help="The maximum number size of the repository", required=False)
+    parser.add_argument("--topic", dest="topic", type=str, default="machine-learning",
+                        help="The repository topics to filter by", required=False)
 
-        
-# Write final results        
-with open(outfilename, 'wt') as fd:
-    fd.write(json.dumps(gitgrab))
+    args = parser.parse_args()
 
+    with open('apikey.txt', 'r') as fd:
+        APIKEY = fd.read().rstrip()
 
+    if not APIKEY:
+        print("Please first paste your API key in file apikey.txt!")
+        sys.exit(1)
+
+    page = 1
+    num_fetched_repositories = 0
+    pbar = tqdm(total=args.maxprojects, desc="Fetching repositories")
+
+    headers = {'Accept': 'application/vnd.github.mercy-preview+json',
+               'Authorization': 'token %s' % APIKEY}
+    query = 'language:%s+topic:%s+stars:%d..%d' % (
+        args.language, args.topic, args.minstars, args.maxstars)
+
+    while num_fetched_repositories <= args.maxprojects:
+        newcount = fetch_repos(headers, query, page, args)
+        pbar.update(newcount)
+
+        num_fetched_repositories += newcount
+        page += 1
+
+        # cut off
+        if args.maxprojects and len(gitgrab) >= args.maxprojects:
+            gitgrab = gitgrab[:args.maxprojects]
+            break
+
+        # Save intermediate results for every 5th page
+        if page % 5 == 0:
+            with open(f"{args.basedir}/gitGrab.json", 'wt') as fd:
+                fd.write(json.dumps(gitgrab))
+    pbar.close()
+    # Write final results
+    print("Done fetching repositories.")
+    with open(f"{args.basedir}/gitGrab.json", 'wt') as fd:
+        fd.write(json.dumps(gitgrab))
